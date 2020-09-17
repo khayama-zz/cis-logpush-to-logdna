@@ -89,7 +89,7 @@ fi
 
 logdna_endpoint="$(echo "$1" | jq -r '.logdna_endpoint')"
 if [ "$logdna_endpoint" == "null" ] || [ -z "$logdna_endpoint" ] ; then
-  logdna_endpoint="https://logs.us-east.logging.cloud.ibm.com/logs/ingest?hostname=$cos_bucket"
+  logdna_endpoint="https://logs.jp-tok.logging.cloud.ibm.com/logs/ingest?hostname=$cos_bucket"
 fi
 
 logdna_endpoint_2nd="$(echo "$1" | jq -r '.logdna_endpoint_2nd')"
