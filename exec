@@ -1,0 +1,170 @@
+#!/bin/bash
+
+# See this good description of how this script updates a basic/skeleton function
+# container and overrides the /action/exec script with this version, to have the
+# function do something useful.
+#
+# http://jamesthom.as/blog/2017/01/16/openwhisk-docker-actions/
+#
+# This script gets packed as a ZIP file attached to the Action resources created
+# on IBM cloud and invoked by an action docker image (public from dockerhub). IBM
+# Cloud Functions then basically, on-deman or as needed:
+#
+#   1. Deploy a container running the specified docker image, "somewhere" (serverless!)
+#   2. Injects the action ZIP into the running image whenever either is changed
+#   3. Waits for triggers as configured (COS object write on our CIS-logpush bucket)
+#   4. Merges event data, service binding data, and customer parameters
+#   5. Passes JSON to the running container using OpenWhisk standard techniques
+#   6. Container HTTP listener takes the JSON event data
+#   7. /action/exec is invoked in the container, with the entire JSON as $1
+#   8. /action/exec can do anything we need, such as pushing data to LogDNA
+#   9. /action/exec writes JSON of its choice to stdout as the "function result
+#   10. All other stdout/stderr data goes to the function logs
+#
+# NOTE: IBM Cloud Functions can be configured to wrire function results/output
+# to LogDNA itself. This is not related to the purpose of this script however.
+#
+# For some sample messages that would be generated as a COS Object trigger, see
+# sample.json. Create a local.json that also includes the binding/paramter data
+# in order to test/run "exec" locally (Linux, MacOS, etc.)
+#
+# Feature of this script:
+#
+#   1. Extract API and ingestion keys from event JSON structure service binding records
+#   2. Extract COS object change fields
+#   3. Gets a COS bearer token and pulls the CIS logpush archive from CIS
+#   4. Filters the JSONL output and removes unneeded fields, to save on LogDNA space
+#   5. Breaks the JSONL into 4000-record chunks to meet LogDNA ingestion limits (10M)
+#   6. Further filters each chunk to convert timestamps, apply dictionary replacements
+#   8. Reformats each 4000-line chunk as a LogDNA REST ingest API structure
+#   9. Pushes the LogDNA-formatted data using curl/REST and ingestion key
+#   10. Data shows up in LogDNA with the bucket name as source, and cis-logpush as app
+#   11. Logs some simple non-sensitive data as part of function stdout
+#
+# Steps 6-9 are done by helper script post-cis-jsonl-to-logdna.sh.
+#
+
+
+
+# Extract the event and parameter data from the incoming function request
+cos_api_key="$(echo "$1" | jq -r '.__bx_creds."cloud-object-storage".apikey')"
+#>&2 echo "COS_API_KEY [$cos_api_key]"
+
+if [ "$cos_api_key" == "null" ] || [ -z "$cos_api_key" ] ; then
+  >&2 echo "__bx_creds.cloud-object-storage service binding missing from input event, error [$cos_api_key]."
+  exit
+fi
+
+cos_bucket="$(echo "$1" | jq -r '.bucket')"
+cos_endpoint="$(echo "$1" | jq -r '.endpoint')"
+cos_object="$(echo "$1" | jq -r '.key')"
+>&2 echo "COS_ENDPOINT [$cos_endpoint] COS_BUCKET [$cos_bucket] COS_OBJECT [$cos_object]"
+
+if [ "$cos_bucket" == "null" ] || [ -z "$cos_bucket" ] || \
+    [ "$cos_endpoint" == "null" ] || [ -z "$cos_endpoint" ] || \
+    [ "$cos_object" == "null" ] || [ -z "$cos_object" ] ; then
+  >&2 echo "COS trigger event information missing from input event, error."
+  exit
+fi
+
+# set default endpoint if not specified, assume US south -- the ingestion
+# endpoint is not specified in the service binding info, and letting this be
+# set by Parameter also allows the "hostname" to be adjusted
+#
+# https://cloud.ibm.com/docs/Log-Analysis-with-LogDNA?topic=LogDNA-ingestion_key
+logdna_chunk_size=4000
+
+logdna_ingest_key="$(echo "$1" | jq -r '.__bx_creds.logdna.ingestion_key')"
+#>&2 echo "LOG_INGEST_KEY [$logdna_ingest_key]"
+
+if [ "$logdna_ingest_key" == "null" ] || [ -z "$logdna_ingest_key" ] ; then
+  >&2 echo "__bx_creds.logdna service binding missing from input event, try override"
+  logdna_ingest_key="$(echo "$1" | jq -r '.logdna_key')"
+fi
+
+if [ "$logdna_ingest_key" == "null" ] || [ -z "$logdna_ingest_key" ] ; then
+  >&2 echo "no usable logdna ingestion key found, error"
+  exit
+fi
+
+logdna_endpoint="$(echo "$1" | jq -r '.logdna_endpoint')"
+if [ "$logdna_endpoint" == "null" ] || [ -z "$logdna_endpoint" ] ; then
+  logdna_endpoint="https://logs.us-east.logging.cloud.ibm.com/logs/ingest?hostname=$cos_bucket"
+fi
+
+logdna_endpoint_2nd="$(echo "$1" | jq -r '.logdna_endpoint_2nd')"
+if [ "$logdna_endpoint_2nd" == "null" ] || [ -z "$logdna_endpoint_2nd" ] ; then
+  logdna_endpoint_2nd=""
+fi
+
+logdna_app="$(echo "$1" | jq -r '.logdna_app')"
+if [ "$logdna_app" == "null" ] || [ -z "$logdna_app" ] ; then
+  logdna_app="${cos_object%%/*}"
+  [ -z "$logdna_app" ] && logdna_app="cislog"
+fi
+
+# For information only... get and process the object regardless of stated size
+cos_object_size="$(echo "$1" | jq -r '.notification.object_length')"
+[ -z "$cos_object_size" ] && cos_object_size=0
+
+# what we need to get with curl, once we have the iam/auth token in place
+object_url="https://$cos_endpoint/$cos_bucket/$cos_object"
+
+
+# Get the data from COS by getting a temporary bearer token based on the API key
+# Passed in as a parameter to the function
+#
+# https://cloud.ibm.com/docs/services/cloud-object-storage?topic=cloud-object-storage-curl
+btoken=$(curl -sX "POST" "https://iam.cloud.ibm.com/identity/token" \
+     -H 'Accept: application/json' \
+     -H 'Content-Type: application/x-www-form-urlencoded' \
+     --data-urlencode "apikey=$cos_api_key" \
+     --data-urlencode "response_type=cloud_iam" \
+     --data-urlencode "grant_type=urn:ibm:params:oauth:grant-type:apikey" \
+     | jq -r '.access_token')
+
+#>&2 echo "TOKEN [$btoken]"
+
+[ -z "$btoken" ] && echo "iam key/bearer token unavailable" >&2
+[ "null" == "$btoken" ] && echo "iam key/bearer token null" >&2
+
+# Get the compressed JSONL gz from CIS logpush and sent it through a filter pipeline
+# -- can add a bunch of grep filters here to golist/stoplist data
+file_dir=./tmp-cis
+[ -d "$file_dir" ] && rm -rf $file_dir
+mkdir -p $file_dir
+
+# in case there are multiple invokcations? Not sure if function is reentrant..
+jobtag=job-$((1 + RANDOM % 1000000))
+file_temp=$file_dir/$jobtag-jsonl-to-logdna.json
+
+curl -s "$object_url" -H "Authorization: bearer $btoken" |
+  zcat |
+  if [ "$2" == "head" ]; then head; else cat; fi \
+  > $file_temp
+#>&2 ls -lt $file_dir
+
+
+# push into LogDNA with the chunking and modifications that make sense
+records=$(wc -l $file_temp | xargs | cut -f1 -d' ')
+[ -z "$records" ] && records=0
+
+ingest_size=$(wc -c $file_temp | xargs | cut -f1 -d' ')
+[ -z "$ingest_size" ] && ingest_size=0
+
+>&2 echo "CISLOG FILESIZE [$cos_object_size] RECORDS [$records] URL [$object_url] "
+chmod +x ./post-cis-jsonl-to-logdna*.sh
+if [ "$records" -gt "0" ] ; then
+
+  >&2 echo "LOG_FIRST_ENDPOINT [$logdna_endpoint] as APP [$logdna_app] and ingestion key [${logdna_ingest_key:0:8}****]"
+  if [ ! -z "$logdna_endpoint_2nd" ] ; then
+    leng=${#logdna_endpoint_2nd}
+    >&2 echo "LOG_SECOND_ENDPOINT [${logdna_endpoint_2nd:0:$leng-24}****] as APP [$logdna_app] and embedded ingestion key "
+  fi
+  source ./post-cis-jsonl-to-logdna-project.sh "$file_temp" "$logdna_endpoint" "$logdna_ingest_key" "$logdna_app" $logdna_chunk_size "https://$cos_endpoint/$cos_bucket" "$btoken" "$logdna_endpoint_2nd"
+
+fi
+[ -z "$TEST_LOCAL" ] && [ -e $file_temp ] && rm -rf $file_dir
+
+# Produce a simple JSON output so the function is successful
+echo "{ \"cis-logpush\":\"$object_url\", \"object-size\":$cos_object_size , \"ingest-size\":$ingest_size ,\"ingested-records\":$records }"
