@@ -161,7 +161,7 @@ if [ "$records" -gt "0" ] ; then
     leng=${#logdna_endpoint_2nd}
     >&2 echo "LOG_SECOND_ENDPOINT [${logdna_endpoint_2nd:0:$leng-24}****] as APP [$logdna_app] and embedded ingestion key "
   fi
-  source ./post-cis-jsonl-to-logdna-project.sh "$file_temp" "$logdna_endpoint" "$logdna_ingest_key" "$logdna_app" $logdna_chunk_size "https://$cos_endpoint/$cos_bucket" "$btoken" "$logdna_endpoint_2nd"
+#  source ./post-cis-jsonl-to-logdna-project.sh "$file_temp" "$logdna_endpoint" "$logdna_ingest_key" "$logdna_app" $logdna_chunk_size "https://$cos_endpoint/$cos_bucket" "$btoken" "$logdna_endpoint_2nd"
 
 fi
 [ -z "$TEST_LOCAL" ] && [ -e $file_temp ] && rm -rf $file_dir
